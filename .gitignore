@@ -1,0 +1,6 @@
+.vs/
+builds/
+projects/**/Debug/
+projects/**/Release/
+
+*.log
