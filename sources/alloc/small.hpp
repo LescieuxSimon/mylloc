@@ -55,7 +55,7 @@ public:
       const size_t pos  = free_index % page_size;
 
       heap_bin* bin = &bins[page][pos];
-      void*     ptr = commit(bin->memory, heap_bin::size);
+      void*     ptr = undo_reset_memory(bin->memory, heap_bin::size);
       if (ptr == nullptr || ptr != bin->memory) { return nullptr; }
 
       free_index     = bin->next_free;
@@ -65,7 +65,7 @@ public:
   }
   bool return_bin(heap_bin* bin) {
     std::lock_guard<std::mutex> guard(mutex);
-    if (!decommit(bin->memory, heap_bin::size)) { return false; }
+    if (!reset_memory(bin->memory, heap_bin::size)) { return false; }
     bin->next_free = free_index;
     free_index     = (void_ptr(bin->memory) - reserved) / heap_bin::size;
     return true;

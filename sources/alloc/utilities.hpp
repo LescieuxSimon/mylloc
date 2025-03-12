@@ -10,6 +10,13 @@
 //
 // =============================================================================
 
+void *reset_memory(void *at, size_t size) {
+  return VirtualAlloc(at, size, MEM_RESET, PAGE_NOACCESS);
+}
+void *undo_reset_memory(void *at, size_t size) {
+  return VirtualAlloc(at, size, MEM_RESET_UNDO, PAGE_READWRITE);
+}
+
 void* reserve(size_t size) {
   return VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
 }
