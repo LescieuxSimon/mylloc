@@ -74,7 +74,7 @@ bool __cdecl release_memory(_In_ void* at) {
 union void_ptr {
   // Constructors.
   constexpr explicit void_ptr(void *ptr) noexcept : pointer{ptr} {}
-  constexpr explicit void_ptr(nullptr_t) noexcept : pointer{nullptr} {}
+  constexpr void_ptr(nullptr_t) noexcept : pointer{nullptr} {}
   constexpr void_ptr(uintptr_t val) noexcept : value{val} {}
   constexpr void_ptr(const void_ptr &) noexcept = default;
 
@@ -136,6 +136,129 @@ private:
 };
 
 // =============================================================================
+// HEAP BINS
+// =============================================================================
+#include <mutex> // For std::mutex.
+
+//
+struct heap_bin {
+    //
+  static constexpr size_t size = 0x10000; // 64Kb.
+
+  void_ptr memory = nullptr; //
+  size_t next_free;          //
+  size_t type;               //
+  size_t used;               //
+};
+
+//
+class heap_bin_list__ {
+  // Indicates an invalid value.
+  static constexpr size_t invalid = ~size_t{0};
+  // Maximum amount of memory that can be allocated via heap bins.
+  static constexpr size_t max_memory = 0x1000000000; // 64Gb.
+  // Maximum memory should be evenly splittable into heap bins.
+  static_assert(max_memory % heap_bin::size == 0);
+
+  // Size of a page in bytes.
+  static constexpr size_t page_byte_size = heap_bin::size;
+  // A page should be evenly splittable into individual bins.
+  static_assert(page_byte_size % sizeof(heap_bin) == 0);
+
+public:
+  // Amount of bins that can fit in a single bin page.
+  static constexpr size_t page_size = page_byte_size / sizeof(heap_bin);
+  // Amount of pages required to cover max memory.
+  static constexpr size_t page_count = max_memory / heap_bin::size / page_size;
+
+public:
+    //
+  heap_bin_list__() : reserved{reserve_memory(nullptr, max_memory)} {}
+  ~heap_bin_list__() { release_memory(reserved); }
+
+  heap_bin *new_bin();
+  bool return_bin(heap_bin *bin);
+  heap_bin *get_bin_for(void *ptr);
+
+private:
+  const void_ptr reserved = nullptr; //
+
+  heap_bin *bins[page_count] = {nullptr}; //
+  size_t free_index = invalid;            //
+  size_t used_bins = 0;                   //
+
+  std::mutex mutex; //
+} heap_bin_list;
+
+//
+heap_bin *heap_bin_list__::new_bin() {
+  std::lock_guard<std::mutex> guard(mutex); //
+
+  // If a free index is available, use it. Otherwise, instantiate a new bin.
+  if (free_index != invalid) {
+    // Get the free bin.
+    const size_t page = free_index / page_size;
+    const size_t pos = free_index % page_size;
+    heap_bin *bin = &bins[page][pos];
+
+    // Reactivate the bin's memory.
+    if (nullptr == reset_undo_memory(bin->memory, heap_bin::size)) {
+      return nullptr;
+    }
+
+    free_index = bin->next_free;
+    return bin;
+
+  } else {
+    // Get the theoretical next bin.
+    const size_t page = used_bins / page_size;
+    const size_t pos = used_bins % page_size;
+
+    if (bins[page] == nullptr) {
+      // We've ran out of allocated bin pages.
+      void *new_page = reserve_commit_memory(nullptr, page_byte_size);
+      if (new_page == nullptr) { return nullptr; }
+      bins[page] = static_cast<heap_bin *>(new_page);
+    }
+    heap_bin *bin = &bins[page][pos];
+
+    // Activate the bin's memory.
+    void *at = reserved + used_bins * heap_bin::size;
+    if (nullptr == commit_memory(at, heap_bin::size)) {
+      return nullptr;
+    }
+
+    used_bins++;
+    return bin;
+  }
+}
+
+//
+bool heap_bin_list__::return_bin(heap_bin *bin) {
+  // Deactivate the bin's memory.
+  if (!reset_memory(bin->memory, heap_bin::size)) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> guard(mutex); //
+
+  bin->next_free = free_index;
+  // Abuse the integer truncation to round down to the nearest bin.
+  free_index = (void_ptr(bin->memory) - reserved) / heap_bin::size;
+  return true;
+}
+
+//
+heap_bin *heap_bin_list__::get_bin_for(void *ptr) {
+  // Abuse the integer truncation to round down to the nearest bin.
+  const size_t index = (void_ptr(ptr) - reserved) / heap_bin::size;
+  const size_t page = index / page_size;
+  const size_t pos = index % page_size;
+
+  return (page < page_count && bins[page]) ? &bins[page][pos] : nullptr;
+}
+
+// =============================================================================
 // C MEMORY MANAGEMENT FUNCTIONS
 // =============================================================================
 
@@ -185,83 +308,6 @@ void operator delete[](void *ptr, std::align_val_t al,
 // =============================================================================
 // =============================================================================
 // =============================================================================
-
-struct heap_bin {
-  static constexpr size_t size = 0x10000;
-
-  void_ptr memory = nullptr;
-  size_t   next_free;
-  size_t   type;
-  size_t   used;
-};
-
-class heap_bin_manager {
-  static constexpr size_t invalid = ~size_t{0};
-
-public:
-  static constexpr size_t page_count = 256;
-  static constexpr size_t page_size  = heap_bin::size / sizeof(heap_bin);
-
-public:
-  heap_bin_manager() : reserved{reserve(0x1000000000)} {}
-  ~heap_bin_manager() { release(reserved); }
-
-  heap_bin* get_new_bin() {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (free_index == invalid) {
-      const size_t page = in_use / page_size;
-      const size_t pos  = in_use % page_size;
-
-      if (bins[page] == nullptr) {
-        bins[page] = static_cast<heap_bin*>(aquire(heap_bin::size));
-        if (bins[page] == nullptr) { return nullptr; }
-      }
-
-      heap_bin* bin = &bins[page][pos];
-      bin->memory   = reserved + in_use * heap_bin::size;
-      void* ptr     = commit(bin->memory, heap_bin::size);
-      if (ptr == nullptr || ptr != bin->memory) { return nullptr; }
-
-      in_use         += 1;
-      bin->next_free  = invalid;
-      return bin;
-
-    } else {
-      const size_t page = free_index / page_size;
-      const size_t pos  = free_index % page_size;
-
-      heap_bin* bin = &bins[page][pos];
-      void*     ptr = undo_reset_memory(bin->memory, heap_bin::size);
-      if (ptr == nullptr || ptr != bin->memory) { return nullptr; }
-
-      free_index     = bin->next_free;
-      bin->next_free = invalid;
-      return bin;
-    }
-  }
-  bool return_bin(heap_bin* bin) {
-    std::lock_guard<std::mutex> guard(mutex);
-    if (!reset_memory(bin->memory, heap_bin::size)) { return false; }
-    bin->next_free = free_index;
-    free_index     = (void_ptr(bin->memory) - reserved) / heap_bin::size;
-    return true;
-  }
-  heap_bin* get_bin_for(void* ptr) {
-    const size_t index = (void_ptr(ptr) - reserved) / heap_bin::size;
-    const size_t page  = index / page_size;
-    const size_t pos   = index % page_size;
-    return bins[page] ? &bins[page][pos] : nullptr;
-  }
-
-private:
-  void_ptr reserved = nullptr;
-
-  heap_bin* bins[256]  = {nullptr};
-  size_t    free_index = invalid;
-  size_t    in_use     = 0;
-
-  std::mutex mutex;
-} bin_mgr;
 
 // =============================================================================
 // =============================================================================
@@ -397,5 +443,3 @@ void deallocate(void* ptr) {
 }
 
 } // namespace tmp_small
-
-#endif // !SMALL_HPP
