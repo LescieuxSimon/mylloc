@@ -11,14 +11,9 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\..\sources\mylloc\malloc.h" />
     <ClInclude Include="..\..\sources\mylloc\mylloc.hpp" />
-    <ClInclude Include="..\..\sources\mylloc\new.hpp" />
-    <ClInclude Include="..\..\sources\mylloc\small.hpp" />
-    <ClInclude Include="..\..\sources\mylloc\utilities.hpp" />
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\sources\mylloc\malloc.cpp" />
     <ClCompile Include="..\..\sources\mylloc\mylloc.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">

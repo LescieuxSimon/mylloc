@@ -127,6 +127,12 @@ union void_ptr {
   [[nodiscard]] constexpr operator uintptr_t() const noexcept { return value; }
   [[nodiscard]] constexpr operator void *() const noexcept { return pointer; }
 
+  // Explicit convertion operator.
+  template <typename Type>
+  [[nodiscard]] constexpr operator Type *() const noexcept {
+    return static_cast<Type *>(pointer);
+  }
+
 private:
   // Make sure this wrapper does not inclure any memory overhead.
   static_assert(sizeof(void *) == sizeof(uintptr_t));
@@ -151,38 +157,17 @@ struct heap_bin {
   size_t used;               //
 };
 
-//
-class heap_bin_list__ {
-  // Indicates an invalid value.
+struct heap_bin_list__ {
   static constexpr size_t invalid = ~size_t{0};
-  // Maximum amount of memory that can be allocated via heap bins.
   static constexpr size_t max_memory = 0x1000000000; // 64Gb.
-  // Maximum memory should be evenly splittable into heap bins.
-  static_assert(max_memory % heap_bin::size == 0);
-
-  // Size of a page in bytes.
   static constexpr size_t page_byte_size = heap_bin::size;
-  // A page should be evenly splittable into individual bins.
-  static_assert(page_byte_size % sizeof(heap_bin) == 0);
-
-public:
-  // Amount of bins that can fit in a single bin page.
   static constexpr size_t page_size = page_byte_size / sizeof(heap_bin);
-  // Amount of pages required to cover max memory.
-  static constexpr size_t page_count = max_memory / heap_bin::size / page_size;
+  static constexpr size_t page_count = max_memory / page_size / heap_bin::size;
 
-public:
-    //
   heap_bin_list__() : reserved{reserve_memory(nullptr, max_memory)} {}
   ~heap_bin_list__() { release_memory(reserved); }
 
-  heap_bin *new_bin();
-  bool return_bin(heap_bin *bin);
-  heap_bin *get_bin_for(void *ptr);
-
-private:
-  const void_ptr reserved = nullptr; //
-
+  void_ptr reserved = nullptr;            //
   heap_bin *bins[page_count] = {nullptr}; //
   size_t free_index = invalid;            //
   size_t used_bins = 0;                   //
@@ -191,71 +176,200 @@ private:
 } heap_bin_list;
 
 //
-heap_bin *heap_bin_list__::new_bin() {
-  std::lock_guard<std::mutex> guard(mutex); //
+heap_bin *new_bin() {
+  auto &list = heap_bin_list;
+  std::lock_guard<std::mutex> guard(list.mutex); //
 
   // If a free index is available, use it. Otherwise, instantiate a new bin.
-  if (free_index != invalid) {
+  if (list.free_index != list.invalid) {
     // Get the free bin.
-    const size_t page = free_index / page_size;
-    const size_t pos = free_index % page_size;
-    heap_bin *bin = &bins[page][pos];
+    const size_t page = list.free_index / list.page_size;
+    const size_t pos = list.free_index % list.page_size;
+    heap_bin *bin = &list.bins[page][pos];
 
     // Reactivate the bin's memory.
     if (nullptr == reset_undo_memory(bin->memory, heap_bin::size)) {
       return nullptr;
     }
 
-    free_index = bin->next_free;
+    list.free_index = bin->next_free;
     return bin;
 
   } else {
     // Get the theoretical next bin.
-    const size_t page = used_bins / page_size;
-    const size_t pos = used_bins % page_size;
+    const size_t page = list.used_bins / list.page_size;
+    const size_t pos = list.used_bins % list.page_size;
 
-    if (bins[page] == nullptr) {
+    if (list.bins[page] == nullptr) {
       // We've ran out of allocated bin pages.
-      void *new_page = reserve_commit_memory(nullptr, page_byte_size);
-      if (new_page == nullptr) { return nullptr; }
-      bins[page] = static_cast<heap_bin *>(new_page);
+      void *new_page = reserve_commit_memory(nullptr, list.page_byte_size);
+      if (new_page == nullptr) {
+        return nullptr;
+      }
+      list.bins[page] = static_cast<heap_bin *>(new_page);
     }
-    heap_bin *bin = &bins[page][pos];
+    heap_bin *bin = &list.bins[page][pos];
 
     // Activate the bin's memory.
-    void *at = reserved + used_bins * heap_bin::size;
+    void *at = list.reserved + list.used_bins * heap_bin::size;
     if (nullptr == commit_memory(at, heap_bin::size)) {
       return nullptr;
     }
 
-    used_bins++;
+    list.used_bins++;
     return bin;
   }
 }
 
 //
-bool heap_bin_list__::return_bin(heap_bin *bin) {
+bool return_bin(heap_bin *bin) {
+  auto &list = heap_bin_list;
+
   // Deactivate the bin's memory.
   if (!reset_memory(bin->memory, heap_bin::size)) {
     return false;
   }
 
-  std::lock_guard<std::mutex> guard(mutex); //
+  std::lock_guard<std::mutex> guard(list.mutex); //
 
-  bin->next_free = free_index;
+  bin->next_free = list.free_index;
   // Abuse the integer truncation to round down to the nearest bin.
-  free_index = (void_ptr(bin->memory) - reserved) / heap_bin::size;
+  list.free_index = (void_ptr(bin->memory) - list.reserved) / heap_bin::size;
   return true;
 }
 
 //
-heap_bin *heap_bin_list__::get_bin_for(void *ptr) {
-  // Abuse the integer truncation to round down to the nearest bin.
-  const size_t index = (void_ptr(ptr) - reserved) / heap_bin::size;
-  const size_t page = index / page_size;
-  const size_t pos = index % page_size;
+heap_bin *get_bin_for(void *ptr) {
+  auto &list = heap_bin_list;
 
-  return (page < page_count && bins[page]) ? &bins[page][pos] : nullptr;
+  // Abuse the integer truncation to round down to the nearest bin.
+  const size_t index = (void_ptr(ptr) - list.reserved) / heap_bin::size;
+  const size_t page = index / list.page_size;
+  const size_t pos = index % list.page_size;
+
+  return page < list.page_count && list.bins[page] ? &list.bins[page][pos]
+                                                   : nullptr;
+}
+
+// =============================================================================
+// SMALL HEAP BLOCKS
+// =============================================================================
+
+struct small_heap_block {
+  small_heap_block *next;
+  small_heap_block *prev;
+};
+
+struct small_heap_block_list {
+  // Keep the same structure as the heap_block to enable safe pointer casting
+  // between the two structures.
+  small_heap_block *next = nullptr;
+  small_heap_block *prev =
+      nullptr; // Since this should always be used as the head of
+               // the free list, the previous pointer would
+               // technically always be null. Maybe use this
+               // field to store some other information instead?
+
+  heap_bin *last_bin = nullptr;
+  size_t block_formatted = 0;
+
+  // Any operation on a block free list should aquire the mutex first.
+  std::mutex mutex;
+};
+
+// =============================================================================
+// SMALL HEAP ALLOCATIONS
+// =============================================================================
+#include <bit>   // for std::bit_width
+#include <mutex> // For std::mutex.
+
+struct  {
+  static constexpr size_t min_type = 4; // (2^4) 16 bytes bin.
+  static constexpr size_t max_type = 9; // (2^9) 512 bytes bin.
+  static constexpr size_t types = max_type - min_type + 1;
+
+  small_heap_block_list free_list[types];
+} small_block_allocator;
+
+void *allocate_small_block(size_t size) {
+  auto &alloc = small_block_allocator;
+
+  const size_t type = std::bit_width(size - 1) - alloc.min_type;
+  small_heap_block_list &list = alloc.free_list[type];
+  std::lock_guard<std::mutex> guard(list.mutex);
+
+  small_heap_block *block = nullptr;
+  if (list.next != nullptr) {
+    block = list.next;
+    list.next = block->next;
+
+    if (list.next) {
+      // The new 'next' block should point back to the head.
+      list.next->prev = reinterpret_cast<small_heap_block *>(&list);
+    }
+
+    // Find the bin of this block and increment its use count.
+    get_bin_for(block)->used += 1;
+
+  } else {
+    const size_t block_size = 1ull << (type + alloc.min_type);
+    const size_t block_count = heap_bin::size / block_size;
+
+    if (list.last_bin != nullptr && list.block_formatted < block_count) {
+      heap_bin *bin = list.last_bin;
+
+      block = static_cast<small_heap_block*>(bin->memory + list.block_formatted * block_size);
+      list.block_formatted += 1;
+      bin->used += 1;
+
+    } else {
+      heap_bin *bin = new_bin();
+      bin->type = type;
+      bin->used += 1;
+
+      block = bin->memory;
+      list.last_bin = bin;
+      list.block_formatted = 1;
+    }
+  }
+
+  return block;
+}
+
+void deallocate_small_block(void *ptr) {
+  auto &alloc = small_block_allocator;
+
+  if (heap_bin *bin = get_bin_for(ptr)) {
+    small_heap_block *block = static_cast<small_heap_block *>(ptr);
+
+    small_heap_block_list &list = alloc.free_list[bin->type];
+    std::lock_guard<std::mutex> guard(list.mutex);
+
+    block->next = list.next;
+    block->prev = reinterpret_cast<small_heap_block *>(&list);
+
+    if (list.next) { list.next->prev = block; }
+    list.next = block;
+
+    if (--bin->used == 0) {
+      if (list.last_bin == bin) {
+        list.last_bin = nullptr;
+        list.block_formatted = 0;
+      }
+
+      const size_t block_size = 1ull << (bin->type + alloc.min_type);
+      const size_t block_count = heap_bin::size / block_size;
+
+      small_heap_block *current = bin->memory;
+      for (size_t i = 0; i < block_count; i++) {
+        if (current->next) { current->next->prev = current->prev; }
+        if (current->prev) { current->prev->next = current->next; }
+        current = void_ptr(current) + block_size;
+      }
+
+      return_bin(bin);
+    }
+  }
 }
 
 // =============================================================================
@@ -304,142 +418,3 @@ void operator delete(void *ptr, std::align_val_t al,
                      std::nothrow_t tag) noexcept; // C++17
 void operator delete[](void *ptr, std::align_val_t al,
                        std::nothrow_t tag) noexcept; // C++17
-
-// =============================================================================
-// =============================================================================
-// =============================================================================
-
-// =============================================================================
-// =============================================================================
-// =============================================================================
-
-namespace tmp_small {
-
-struct heap_block {
-  heap_block* next = nullptr;
-  heap_block* prev = nullptr;
-};
-
-struct heap_block_list {
-  // Keep the same structure as the heap_block to enable safe pointer casting
-  // between the two structures.
-  heap_block* next = nullptr;
-  heap_block* prev = nullptr; // Since this should always be used as the head of
-                              // the free list, the previous pointer would
-                              // technically always be null. Maybe use this
-                              // field to store some other information instead?
-
-  heap_bin* last_bin        = nullptr;
-  size_t    block_formatted = 0;
-
-  // Any operation on a block free list should aquire the mutex first.
-  std::mutex mutex;
-};
-
-struct heap_allocator {
-  static constexpr size_t min_block_type = 4; // (2^4) 16 bytes bin.
-  static constexpr size_t max_block_type = 9; // (2^9) 512 bytes bin.
-  static constexpr size_t block_types    = max_block_type - min_block_type + 1;
-
-  heap_block_list free_list[block_types];
-} global_allocator;
-
-void format_bin(heap_bin* bin) {
-  const size_t block_size = 1ull
-                            << (bin->type + heap_allocator::min_block_type);
-  const size_t block_count = heap_bin::size / block_size;
-
-  heap_block* prev = nullptr;
-  heap_block* curr = bin->memory;
-  heap_block* next = bin->memory + block_size;
-  for (size_t i = 0; i < block_count; i++) {
-    curr->prev = prev;
-    curr->next = next;
-
-    prev = curr;
-    curr = next;
-    next = void_ptr(next) + block_size;
-  }
-  prev->next = nullptr;
-}
-
-void clean_bin(heap_bin* bin) {
-  const size_t block_size = 1ull
-                            << (bin->type + heap_allocator::min_block_type);
-  const size_t block_count = heap_bin::size / block_size;
-
-  heap_block* block = bin->memory;
-  for (size_t i = 0; i < block_count; i++) {
-    if (block->next) { block->next->prev = block->prev; }
-    if (block->prev) { block->prev->next = block->next; }
-    block = void_ptr(block) + block_size;
-  }
-}
-
-void* allocate(size_t size) {
-  const size_t block_type =
-      std::bit_width(size - 1) - heap_allocator::min_block_type;
-  heap_block* block = nullptr;
-
-  heap_block_list& free_list = global_allocator.free_list[block_type];
-  std::lock_guard<std::mutex> guard(free_list.mutex);
-
-  if (free_list.next == nullptr) {
-    const size_t block_size = 1ull
-                              << (block_type + heap_allocator::min_block_type);
-    const size_t block_count = heap_bin::size / block_size;
-    if (free_list.last_bin != nullptr && free_list.block_formatted < block_count) {
-      heap_bin* bin = free_list.last_bin;
-      block         = (bin->memory + free_list.block_formatted * block_size);
-      free_list.block_formatted += 1;
-      bin->used                 += 1;
-    } else {
-      heap_bin* bin = bin_mgr.get_new_bin();
-      bin->type     = block_type;
-      bin->used     += 1;
-
-      block                     = bin->memory;
-      free_list.last_bin        = bin;
-      free_list.block_formatted = 1;
-    }
-
-  } else {
-    // Use the next available block as our return value.
-    block          = free_list.next;
-    free_list.next = block->next;
-    if (block->next) {
-      // The new 'next' block should point back to the head.
-      block->next->prev = reinterpret_cast<heap_block*>(&free_list);
-    }
-
-    // Find the bin of this block and increment its use count.
-    bin_mgr.get_bin_for(block)->used += 1;
-  }
-
-  return block;
-}
-
-void deallocate(void* ptr) {
-  if (heap_bin* bin = bin_mgr.get_bin_for(ptr)) {
-    heap_block* block = static_cast<heap_block*>(ptr);
-
-    heap_block_list& free_list = global_allocator.free_list[bin->type];
-    std::lock_guard<std::mutex> guard(free_list.mutex);
-
-    block->next = free_list.next;
-    block->prev = reinterpret_cast<heap_block*>(&free_list);
-    if (free_list.next) { free_list.next->prev = block; }
-    free_list.next = block;
-
-    if (--bin->used == 0) {
-      if (free_list.last_bin == bin) {
-        free_list.last_bin        = nullptr;
-        free_list.block_formatted = 0;
-      }
-      clean_bin(bin);
-      bin_mgr.return_bin(bin);
-    }
-  }
-}
-
-} // namespace tmp_small
